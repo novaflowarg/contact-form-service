@@ -271,7 +271,7 @@ Deno.serve(async (req) => {
     `• *Origin:* ${origin}\n` +
     `• *IP:* ${ip}`;
 
-  //await postToSlack(String(settings.slack_webhook_url), slackText);
+  await postToSlack(String(settings.slack_webhook_url), slackText);
 
   return jsonResponse(200, { ok: true }, corsHeaders(origin));
 });

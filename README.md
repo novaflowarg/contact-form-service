@@ -64,16 +64,16 @@ El campo contact_type acepta los siguientes valores (si se envía otro, por defe
 ```bash
 curl -X POST https://webngfbglewttiolegwk.supabase.co/functions/v1/contact \
   -H "Content-Type: application/json" \
-  -H "Origin: https://cf-obras-civiles-web-kplb.bolt.host" \
+  -H "Origin: https://novaflow.com.ar" \
   -d '{
-    "tenant": "cfobras",
+    "tenant": "novaflow",
     "name": "Test User",
     "email": "test@example.com",
     "company_name": "Test Corp",
     "contact_type": "general_query",
     "message": "Este es un mensaje de prueba con nuevos campos",
     "company_website": ""
-  }'
+  }'                                                                                  
 
 ```
 
