@@ -64,6 +64,7 @@ El campo contact_type acepta los siguientes valores (si se envía otro, por defe
 ```bash
 curl -X POST https://webngfbglewttiolegwk.supabase.co/functions/v1/contact \
   -H "Content-Type: application/json" \
+  -H "Origin: https://cf-obras-civiles-web-kplb.bolt.host" \
   -d '{
     "tenant": "cfobras",
     "name": "Test User",
@@ -73,6 +74,7 @@ curl -X POST https://webngfbglewttiolegwk.supabase.co/functions/v1/contact \
     "message": "Este es un mensaje de prueba con nuevos campos",
     "company_website": ""
   }'
+
 ```
 
 ### Respuesta Exitosa
@@ -82,6 +84,7 @@ curl -X POST https://webngfbglewttiolegwk.supabase.co/functions/v1/contact \
   "ok": true
 }
 ```
+> **Importante**: El header Origin debe estar en la tabla tenant_contact_settings.allowed_origins.
 
 ## Despliegue
 
