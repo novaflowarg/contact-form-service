@@ -314,7 +314,7 @@ Deno.serve(async (req) => {
 
   // Slack message (include new fields)
   const slackText =
-    `🟦 *Nuevo contacto (${tenant})*\n` +
+    `🟦 *Nuevo contacto*\n` +
     `• *Tipo:* ${formatContactType(contact_type)}\n` +
     (company_name ? `• *Compañía:* ${company_name}\n` : "") +
     `• *Nombre:* ${name}\n` +
