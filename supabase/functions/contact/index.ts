@@ -3,12 +3,14 @@
 // Edge Function: recibe POST JSON desde sitio estático (Neolo), valida tenant + Origin allowlist,
 // honeypot + rate limit (RPC), guarda auditoría en form_submissions y notifica SINCRÓNICAMENTE a Slack.
 //
+// Stealth: al cliente siempre responde 200 {ok:true}, pero LOGGEA el motivo interno de cualquier rechazo.
+//
 // Alineación esperada con DDL:
 // - tenant_contact_settings: tenant_slug, allowed_origins, slack_webhook_url, rate_limit_per_hour, enabled
 // - form_submissions: tenant_slug, name, email, phone, company_name, contact_type, message, ip, user_agent, created_at
 // - RPC: check_and_increment_rate_limit(p_tenant_slug text, p_ip inet, p_limit int) returns boolean
 
-import "jsr:@supabase/functions-js/edge-runtime.d.ts"; 
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
 // =====================
@@ -111,12 +113,22 @@ function corsHeaders(origin: string): HeadersInit {
     "access-control-allow-methods": "POST, OPTIONS",
     "access-control-allow-headers": "content-type",
     "access-control-max-age": "86400",
-    "vary": "Origin",
+    vary: "Origin",
   };
 }
 
 function okStealth(origin: string): Response {
   return jsonResponse(200, { ok: true }, origin ? corsHeaders(origin) : {});
+}
+
+/**
+ * Siempre devuelve 200 {ok:true}, pero deja trazabilidad en logs.
+ * Útil para no filtrar señales a bots, manteniendo debug operativo.
+ */
+function rejectStealth(origin: string, reason: string, meta?: Record<string, unknown>): Response {
+  // No loggear PII sensible innecesaria (mensaje completo, etc). Metadatos acotados.
+  console.warn("CONTACT_REJECTED:", reason, meta ?? {});
+  return okStealth(origin);
 }
 
 function normalizeContactType(value: unknown): ContactType {
@@ -128,13 +140,13 @@ function normalizeContactType(value: unknown): ContactType {
 function formatContactType(ct: ContactType): string {
   switch (ct) {
     case "budget_request":
-      return "Budget request";
+      return "Solicitud de presupuesto";
     case "general_query":
-      return "General query";
+      return "Consulta general";
     case "commercial_proposal":
-      return "Commercial proposal";
+      return "Propuesta comercial";
     case "other":
-      return "Other";
+      return "Otro";
   }
 }
 
@@ -168,12 +180,15 @@ Deno.serve(async (req) => {
   }
 
   if (req.method !== "POST") {
+    // Para métodos inválidos no hace falta stealth (no es un bot signal relevante),
+    // pero si querés 100% stealth, reemplazá por rejectStealth(...)
     return jsonResponse(405, { error: "method_not_allowed" });
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !serviceRoleKey) {
+    // Esto es un error de server (sí conviene devolver 500 real)
     return jsonResponse(500, { error: "server_misconfigured" });
   }
 
@@ -183,7 +198,8 @@ Deno.serve(async (req) => {
   try {
     payload = await req.json();
   } catch {
-    return STEALTH_MODE_ALWAYS_200 ? okStealth(origin) : jsonResponse(400, { error: "invalid_json" });
+    // Stealth con log
+    return rejectStealth(origin, "invalid_json");
   }
 
   const tenant = normalizeTenantSlug(String(payload.tenant ?? ""));
@@ -195,15 +211,30 @@ Deno.serve(async (req) => {
   const message = String(payload.message ?? "").trim();
   const honeypot = String(payload[HONEYPOT_FIELD] ?? "").trim();
 
-  if (honeypot.length > 0) return okStealth(origin);
+  // Honeypot (siempre stealth)
+  if (honeypot.length > 0) {
+    return rejectStealth(origin, "honeypot_triggered", { tenant });
+  }
 
-  // Basic validation
-  if (!tenant || tenant.length > 64) return STEALTH_MODE_ALWAYS_200 ? okStealth(origin) : jsonResponse(400, { error: "invalid_tenant" });
-  if (!name || name.length > MAX_NAME_LEN) return STEALTH_MODE_ALWAYS_200 ? okStealth(origin) : jsonResponse(400, { error: "invalid_name" });
-  if (!email || email.length > MAX_EMAIL_LEN || !isValidEmail(email)) return STEALTH_MODE_ALWAYS_200 ? okStealth(origin) : jsonResponse(400, { error: "invalid_email" });
-  if (phone.length > MAX_PHONE_LEN) return STEALTH_MODE_ALWAYS_200 ? okStealth(origin) : jsonResponse(400, { error: "invalid_phone" });
-  if (company_name.length > MAX_COMPANY_NAME_LEN) return STEALTH_MODE_ALWAYS_200 ? okStealth(origin) : jsonResponse(400, { error: "invalid_company_name" });
-  if (!message || message.length > MAX_MESSAGE_LEN) return STEALTH_MODE_ALWAYS_200 ? okStealth(origin) : jsonResponse(400, { error: "invalid_message" });
+  // Basic validation (stealth + log)
+  if (!tenant || tenant.length > 64) {
+    return rejectStealth(origin, "invalid_tenant", { tenant });
+  }
+  if (!name || name.length > MAX_NAME_LEN) {
+    return rejectStealth(origin, "invalid_name", { tenant });
+  }
+  if (!email || email.length > MAX_EMAIL_LEN || !isValidEmail(email)) {
+    return rejectStealth(origin, "invalid_email", { tenant });
+  }
+  if (phone.length > MAX_PHONE_LEN) {
+    return rejectStealth(origin, "invalid_phone", { tenant });
+  }
+  if (company_name.length > MAX_COMPANY_NAME_LEN) {
+    return rejectStealth(origin, "invalid_company_name", { tenant });
+  }
+  if (!message || message.length > MAX_MESSAGE_LEN) {
+    return rejectStealth(origin, "invalid_message", { tenant });
+  }
 
   // Load tenant settings
   const { data: settingsData, error: settingsErr } = await sb
@@ -212,17 +243,35 @@ Deno.serve(async (req) => {
     .eq("tenant_slug", tenant)
     .maybeSingle();
 
-  const settings = settingsData as TenantSettings | null;
-
-  if (settingsErr || !settings || settings.enabled !== true) {
-    return okStealth(origin);
+  if (settingsErr) {
+    console.error("CONTACT_SETTINGS_ERROR:", settingsErr);
+    return rejectStealth(origin, "settings_query_failed", { tenant });
   }
 
-  // Origin allowlist
+  const settings = settingsData as TenantSettings | null;
+
+  if (!settings) {
+    return rejectStealth(origin, "tenant_not_found", { tenant });
+  }
+
+  if (settings.enabled !== true) {
+    return rejectStealth(origin, "tenant_disabled", { tenant });
+  }
+
+  // Origin allowlist (stealth + log)
   const allowedOrigins = settings.allowed_origins ?? [];
-  if (!origin || !allowedOrigins.includes(origin)) {
-    if (STEALTH_MODE_ALWAYS_200) return okStealth(origin);
-    return jsonResponse(403, { error: "forbidden_origin" }, corsHeaders(origin));
+
+  if (!origin) {
+    return rejectStealth(origin, "missing_origin", { tenant });
+  }
+
+  if (!allowedOrigins.includes(origin)) {
+    return rejectStealth(origin, "forbidden_origin", {
+      tenant,
+      origin,
+      // útil para debug, pero si te preocupa filtrar en logs, removelo:
+      allowedOrigins,
+    });
   }
 
   // Rate limit via RPC (atomic)
@@ -235,9 +284,13 @@ Deno.serve(async (req) => {
     p_limit: settings.rate_limit_per_hour ?? 10,
   }) as { data: boolean | null; error: unknown };
 
-  if (rlErr || allowed !== true) {
-    if (STEALTH_MODE_ALWAYS_200) return okStealth(origin);
-    return jsonResponse(429, { error: "rate_limited" }, corsHeaders(origin));
+  if (rlErr) {
+    console.error("RATE_LIMIT_RPC_ERROR:", rlErr);
+    return rejectStealth(origin, "rate_limit_failed", { tenant, ip });
+  }
+
+  if (allowed !== true) {
+    return rejectStealth(origin, "rate_limited", { tenant, ip });
   }
 
   // Persist audit row (best-effort; do not block user if insert fails)
@@ -261,15 +314,13 @@ Deno.serve(async (req) => {
 
   // Slack message (include new fields)
   const slackText =
-    `🟦 *New contact (${tenant})*\n` +
-    `• *Type:* ${formatContactType(contact_type)}\n` +
-    (company_name ? `• *Company:* ${company_name}\n` : "") +
-    `• *Name:* ${name}\n` +
-    `• *Email:* ${email}\n` +
-    (phone ? `• *Phone:* ${phone}\n` : "") +
-    `• *Message:*\n${message}\n` +
-    `• *Origin:* ${origin}\n` +
-    `• *IP:* ${ip}`;
+    `🟦 *Nuevo contacto (${tenant})*\n` +
+    `• *Tipo:* ${formatContactType(contact_type)}\n` +
+    (company_name ? `• *Compañía:* ${company_name}\n` : "") +
+    `• *Nombre:* ${name}\n` +
+    `• *Correo electrónico:* ${email}\n` +
+    (phone ? `• *Teléfono:* ${phone}\n` : "") +
+    `• *Mensaje:* ${message}\n`;
 
   await postToSlack(String(settings.slack_webhook_url), slackText);
 
