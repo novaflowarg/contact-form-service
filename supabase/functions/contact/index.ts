@@ -154,8 +154,20 @@ function normalizeContactTypeRawForSlack(value: unknown): string {
   const raw = String(value ?? "").trim();
   if (!raw) return "General";
 
-  const compact = raw.replace(/\s+/g, " ").slice(0, MAX_CONTACT_TYPE_RAW_LEN);
-  return compact || "General";
+  // 1) Reemplaza separadores comunes por espacio
+  const withSpaces = raw.replace(/[_\-.]+/g, " ");
+
+  // 2) Colapsa espacios múltiples
+  const compact = withSpaces.replace(/\s+/g, " ").trim();
+
+  // 3) Capitaliza cada palabra
+  const capitalized = compact
+    .split(" ")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+
+  // 4) Limita longitud visual
+  return capitalized.slice(0, MAX_CONTACT_TYPE_RAW_LEN) || "General";
 }
 
 /**
