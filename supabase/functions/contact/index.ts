@@ -3,17 +3,14 @@
 // Edge Function: recibe POST JSON desde sitio estático (Neolo), valida tenant + Origin allowlist,
 // honeypot + rate limit (RPC), guarda auditoría en form_submissions y notifica SINCRÓNICAMENTE a Slack.
 //
-// ✅ Cambio pedido:
-// - Cuando el motivo de rechazo sea "CONTACT_REJECTED" (problemas de servicio/config/tenant/origin/etc),
-//   devolver 503 con: { error: "CONTACT_REJECTED" } para que el frontend muestre:
-//   "Servicio no disponible. Intente nuevamente más tarde."
-// - Mantener STEALTH para spam/validaciones de payload (devuelve 200 {ok:true})
-// - Loggear SIEMPRE el motivo interno del rechazo (sin exponerlo al cliente).
+// ✅ Cambios (Opción A - "Libre pero saneado"):
+// - Se guarda contact_type SANEADO en DB (estable para reporting).
+// - Se envía a Slack el contact_type RAW (más humano / tal cual viene del front).
 //
-// Alineación esperada con DDL:
-// - tenant_contact_settings: tenant_slug, allowed_origins, slack_webhook_url, rate_limit_per_hour, enabled
-// - form_submissions: tenant_slug, name, email, phone, company_name, contact_type, message, ip, user_agent, created_at
-// - RPC: check_and_increment_rate_limit(p_tenant_slug text, p_ip inet, p_limit int) returns boolean
+// ✅ Cambio pedido (se mantiene):
+// - Rechazos "de servicio/config/origin/tenant/etc" => 503 { error: "CONTACT_REJECTED" }
+// - Stealth para spam/validaciones de payload => 200 { ok:true }
+// - Loggear SIEMPRE el motivo interno del rechazo (sin exponerlo al cliente).
 
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
@@ -30,24 +27,19 @@ const SUBMISSIONS_TABLE = "form_submissions";
 // =====================
 // CONFIG
 // =====================
-const STEALTH_MODE_ALWAYS_200 = true;
+const MAX_TENANT_LEN = 64;
 
 const MAX_NAME_LEN = 120;
 const MAX_EMAIL_LEN = 180;
 const MAX_PHONE_LEN = 50;
 const MAX_COMPANY_NAME_LEN = 160;
+
+const MAX_CONTACT_TYPE_RAW_LEN = 80; // visual para Slack
+const MAX_CONTACT_TYPE_LEN = 60; // key normalizada para DB
+
 const MAX_MESSAGE_LEN = 4000;
 
 const HONEYPOT_FIELD = "company_website";
-
-const CONTACT_TYPES = [
-  "budget_request",
-  "general_query",
-  "commercial_proposal",
-  "other",
-] as const;
-
-type ContactType = (typeof CONTACT_TYPES)[number];
 
 // =====================
 // TYPES
@@ -58,7 +50,7 @@ type ContactPayload = {
   email?: string;
   phone?: string;
   company_name?: string;
-  contact_type?: ContactType | string;
+  contact_type?: string;
   message?: string;
   [HONEYPOT_FIELD]?: string;
 };
@@ -128,22 +120,18 @@ function okStealth(origin: string): Response {
 
 /**
  * Rechazo en "modo stealth": 200 {ok:true}, pero deja trazabilidad en logs.
- * Útil para no filtrar señales a bots, manteniendo debug operativo.
  */
 function rejectStealth(
   origin: string,
   reason: string,
   meta?: Record<string, unknown>,
 ): Response {
-  // No loggear PII sensible innecesaria (mensaje completo, etc). Metadatos acotados.
   console.warn("CONTACT_REJECTED_STEALTH:", reason, meta ?? {});
   return okStealth(origin);
 }
 
 /**
- * Rechazo "de servicio": devuelve 503 con error CONTACT_REJECTED para que el frontend muestre:
- * "Servicio no disponible. Intente nuevamente más tarde."
- * Siempre loggea el motivo interno (sin exponerlo al cliente).
+ * Rechazo "de servicio": 503 { error: "CONTACT_REJECTED" } (front: "Servicio no disponible...")
  */
 function rejectService(
   origin: string,
@@ -158,23 +146,40 @@ function rejectService(
   );
 }
 
-function normalizeContactType(value: unknown): ContactType {
-  const raw = String(value ?? "").trim().toLowerCase();
-  if ((CONTACT_TYPES as readonly string[]).includes(raw)) return raw as ContactType;
-  return "general_query";
+/**
+ * RAW para Slack: humano y tal cual viene del front (acotado a longitud).
+ * No “limpia” agresivo: solo trim + colapsa whitespace + corta.
+ */
+function normalizeContactTypeRawForSlack(value: unknown): string {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "General";
+
+  const compact = raw.replace(/\s+/g, " ").slice(0, MAX_CONTACT_TYPE_RAW_LEN);
+  return compact || "General";
 }
 
-function formatContactType(ct: ContactType): string {
-  switch (ct) {
-    case "budget_request":
-      return "Solicitud de presupuesto";
-    case "general_query":
-      return "Consulta general";
-    case "commercial_proposal":
-      return "Propuesta comercial";
-    case "other":
-      return "Otro";
-  }
+/**
+ * Key para DB: estable para reporting.
+ * - lowercase
+ * - trim
+ * - espacios -> "_"
+ * - allow chars (a-z, 0-9, _, -, .)
+ * - limita longitud
+ * - fallback
+ */
+function normalizeContactTypeForDb(value: unknown): string {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return "general_query";
+
+  const spaced = raw.replace(/\s+/g, "_");
+  const cleaned = spaced.replace(/[^a-z0-9_.-]/g, "");
+  const collapsed = cleaned
+    .replace(/_+/g, "_")
+    .replace(/-+/g, "-")
+    .replace(/\.+/g, ".");
+
+  const out = collapsed.slice(0, MAX_CONTACT_TYPE_LEN);
+  return out || "general_query";
 }
 
 async function postToSlack(webhookUrl: string, text: string): Promise<boolean> {
@@ -207,14 +212,12 @@ Deno.serve(async (req) => {
   }
 
   if (req.method !== "POST") {
-    // No hace falta stealth acá.
     return jsonResponse(405, { error: "method_not_allowed" });
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !serviceRoleKey) {
-    // Error real de servicio/config
     return rejectService(origin, "server_misconfigured_missing_env");
   }
 
@@ -224,7 +227,6 @@ Deno.serve(async (req) => {
   try {
     payload = await req.json();
   } catch (e) {
-    // Payload inválido => stealth
     return rejectStealth(origin, "invalid_json", { err: String(e) });
   }
 
@@ -233,17 +235,21 @@ Deno.serve(async (req) => {
   const email = String(payload.email ?? "").trim().toLowerCase();
   const phone = String(payload.phone ?? "").trim();
   const company_name = String(payload.company_name ?? "").trim();
-  const contact_type = normalizeContactType(payload.contact_type);
+
+  // 👇 dual: raw para Slack, key para DB
+  const contact_type_raw = normalizeContactTypeRawForSlack(payload.contact_type);
+  const contact_type_db = normalizeContactTypeForDb(payload.contact_type);
+
   const message = String(payload.message ?? "").trim();
   const honeypot = String(payload[HONEYPOT_FIELD] ?? "").trim();
 
-  // Honeypot (siempre stealth)
+  // Honeypot (stealth)
   if (honeypot.length > 0) {
     return rejectStealth(origin, "honeypot_triggered", { tenant });
   }
 
   // Basic validation (stealth + log)
-  if (!tenant || tenant.length > 64) {
+  if (!tenant || tenant.length > MAX_TENANT_LEN) {
     return rejectStealth(origin, "invalid_tenant", { tenant });
   }
   if (!name || name.length > MAX_NAME_LEN) {
@@ -270,19 +276,16 @@ Deno.serve(async (req) => {
     .maybeSingle();
 
   if (settingsErr) {
-    // Error de servicio (DB/settings)
     return rejectService(origin, "settings_query_failed", { tenant });
   }
 
   const settings = settingsData as TenantSettings | null;
 
   if (!settings) {
-    // Tenant inexistente => servicio no disponible
     return rejectService(origin, "tenant_not_found", { tenant });
   }
 
   if (settings.enabled !== true) {
-    // Tenant deshabilitado => servicio no disponible
     return rejectService(origin, "tenant_disabled", { tenant });
   }
 
@@ -294,7 +297,6 @@ Deno.serve(async (req) => {
   }
 
   if (!allowedOrigins.includes(origin)) {
-    // No devolvemos 403: para el usuario final es "servicio no disponible"
     return rejectService(origin, "forbidden_origin", { tenant, origin });
   }
 
@@ -309,17 +311,15 @@ Deno.serve(async (req) => {
   })) as { data: boolean | null; error: unknown };
 
   if (rlErr) {
-    // Fallo del RPC => servicio no disponible
     return rejectService(origin, "rate_limit_rpc_error", { tenant, ip });
   }
 
   if (allowed !== true) {
-    // Rate limit "normal" => 429 (esto NO es CONTACT_REJECTED)
     console.warn("CONTACT_RATE_LIMITED:", { tenant, ip });
     return jsonResponse(429, { error: "rate_limited" }, corsHeaders(origin));
   }
 
-  // Persist audit row (best-effort; do not block user if insert fails)
+  // Persist audit row (best-effort)
   try {
     const { error: insertErr } = await sb.from(SUBMISSIONS_TABLE).insert({
       tenant_slug: tenant,
@@ -327,7 +327,7 @@ Deno.serve(async (req) => {
       email,
       phone: phone || null,
       company_name: company_name || null,
-      contact_type,
+      contact_type: contact_type_db, // ✅ DB estable
       message,
       ip: ip === "0.0.0.0" ? null : ip,
       user_agent: user_agent || null,
@@ -338,20 +338,18 @@ Deno.serve(async (req) => {
     console.error("Insert form_submissions threw:", e);
   }
 
-  // Slack message (include new fields)
+  // Slack message (RAW humano)
   const slackText =
     `🟦 *Nuevo contacto*\n` +
-    `• *Tipo:* ${formatContactType(contact_type)}\n` +
+    `• *Tipo:* ${contact_type_raw}\n` +
     (company_name ? `• *Compañía:* ${company_name}\n` : "") +
     `• *Nombre:* ${name}\n` +
     `• *Correo electrónico:* ${email}\n` +
     (phone ? `• *Teléfono:* ${phone}\n` : "") +
     `• *Mensaje:* ${message}\n`;
 
-
   const slackOk = await postToSlack(String(settings.slack_webhook_url), slackText);
 
-  // Si Slack falla, devolvemos CONTACT_REJECTED (servicio no disponible)
   if (!slackOk) {
     return rejectService(origin, "slack_webhook_failed", { tenant });
   }
