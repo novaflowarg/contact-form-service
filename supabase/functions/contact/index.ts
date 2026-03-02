@@ -3,7 +3,12 @@
 // Edge Function: recibe POST JSON desde sitio estático (Neolo), valida tenant + Origin allowlist,
 // honeypot + rate limit (RPC), guarda auditoría en form_submissions y notifica SINCRÓNICAMENTE a Slack.
 //
-// Stealth: al cliente siempre responde 200 {ok:true}, pero LOGGEA el motivo interno de cualquier rechazo.
+// ✅ Cambio pedido:
+// - Cuando el motivo de rechazo sea "CONTACT_REJECTED" (problemas de servicio/config/tenant/origin/etc),
+//   devolver 503 con: { error: "CONTACT_REJECTED" } para que el frontend muestre:
+//   "Servicio no disponible. Intente nuevamente más tarde."
+// - Mantener STEALTH para spam/validaciones de payload (devuelve 200 {ok:true})
+// - Loggear SIEMPRE el motivo interno del rechazo (sin exponerlo al cliente).
 //
 // Alineación esperada con DDL:
 // - tenant_contact_settings: tenant_slug, allowed_origins, slack_webhook_url, rate_limit_per_hour, enabled
@@ -122,13 +127,35 @@ function okStealth(origin: string): Response {
 }
 
 /**
- * Siempre devuelve 200 {ok:true}, pero deja trazabilidad en logs.
+ * Rechazo en "modo stealth": 200 {ok:true}, pero deja trazabilidad en logs.
  * Útil para no filtrar señales a bots, manteniendo debug operativo.
  */
-function rejectStealth(origin: string, reason: string, meta?: Record<string, unknown>): Response {
+function rejectStealth(
+  origin: string,
+  reason: string,
+  meta?: Record<string, unknown>,
+): Response {
   // No loggear PII sensible innecesaria (mensaje completo, etc). Metadatos acotados.
-  console.warn("CONTACT_REJECTED:", reason, meta ?? {});
+  console.warn("CONTACT_REJECTED_STEALTH:", reason, meta ?? {});
   return okStealth(origin);
+}
+
+/**
+ * Rechazo "de servicio": devuelve 503 con error CONTACT_REJECTED para que el frontend muestre:
+ * "Servicio no disponible. Intente nuevamente más tarde."
+ * Siempre loggea el motivo interno (sin exponerlo al cliente).
+ */
+function rejectService(
+  origin: string,
+  reason: string,
+  meta?: Record<string, unknown>,
+): Response {
+  console.error("CONTACT_REJECTED:", reason, meta ?? {});
+  return jsonResponse(
+    503,
+    { error: "CONTACT_REJECTED" },
+    origin ? corsHeaders(origin) : {},
+  );
 }
 
 function normalizeContactType(value: unknown): ContactType {
@@ -180,16 +207,15 @@ Deno.serve(async (req) => {
   }
 
   if (req.method !== "POST") {
-    // Para métodos inválidos no hace falta stealth (no es un bot signal relevante),
-    // pero si querés 100% stealth, reemplazá por rejectStealth(...)
+    // No hace falta stealth acá.
     return jsonResponse(405, { error: "method_not_allowed" });
   }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !serviceRoleKey) {
-    // Esto es un error de server (sí conviene devolver 500 real)
-    return jsonResponse(500, { error: "server_misconfigured" });
+    // Error real de servicio/config
+    return rejectService(origin, "server_misconfigured_missing_env");
   }
 
   const sb = createClient(supabaseUrl, serviceRoleKey);
@@ -197,9 +223,9 @@ Deno.serve(async (req) => {
   let payload: ContactPayload;
   try {
     payload = await req.json();
-  } catch {
-    // Stealth con log
-    return rejectStealth(origin, "invalid_json");
+  } catch (e) {
+    // Payload inválido => stealth
+    return rejectStealth(origin, "invalid_json", { err: String(e) });
   }
 
   const tenant = normalizeTenantSlug(String(payload.tenant ?? ""));
@@ -244,53 +270,53 @@ Deno.serve(async (req) => {
     .maybeSingle();
 
   if (settingsErr) {
-    console.error("CONTACT_SETTINGS_ERROR:", settingsErr);
-    return rejectStealth(origin, "settings_query_failed", { tenant });
+    // Error de servicio (DB/settings)
+    return rejectService(origin, "settings_query_failed", { tenant });
   }
 
   const settings = settingsData as TenantSettings | null;
 
   if (!settings) {
-    return rejectStealth(origin, "tenant_not_found", { tenant });
+    // Tenant inexistente => servicio no disponible
+    return rejectService(origin, "tenant_not_found", { tenant });
   }
 
   if (settings.enabled !== true) {
-    return rejectStealth(origin, "tenant_disabled", { tenant });
+    // Tenant deshabilitado => servicio no disponible
+    return rejectService(origin, "tenant_disabled", { tenant });
   }
 
-  // Origin allowlist (stealth + log)
+  // Origin allowlist (servicio)
   const allowedOrigins = settings.allowed_origins ?? [];
 
   if (!origin) {
-    return rejectStealth(origin, "missing_origin", { tenant });
+    return rejectService(origin, "missing_origin", { tenant });
   }
 
   if (!allowedOrigins.includes(origin)) {
-    return rejectStealth(origin, "forbidden_origin", {
-      tenant,
-      origin,
-      // útil para debug, pero si te preocupa filtrar en logs, removelo:
-      allowedOrigins,
-    });
+    // No devolvemos 403: para el usuario final es "servicio no disponible"
+    return rejectService(origin, "forbidden_origin", { tenant, origin });
   }
 
   // Rate limit via RPC (atomic)
   const ip = getClientIp(req);
   const user_agent = getUserAgent(req);
 
-  const { data: allowed, error: rlErr } = await sb.rpc(RATE_LIMIT_RPC, {
+  const { data: allowed, error: rlErr } = (await sb.rpc(RATE_LIMIT_RPC, {
     p_tenant_slug: tenant,
     p_ip: ip,
     p_limit: settings.rate_limit_per_hour ?? 10,
-  }) as { data: boolean | null; error: unknown };
+  })) as { data: boolean | null; error: unknown };
 
   if (rlErr) {
-    console.error("RATE_LIMIT_RPC_ERROR:", rlErr);
-    return rejectStealth(origin, "rate_limit_failed", { tenant, ip });
+    // Fallo del RPC => servicio no disponible
+    return rejectService(origin, "rate_limit_rpc_error", { tenant, ip });
   }
 
   if (allowed !== true) {
-    return rejectStealth(origin, "rate_limited", { tenant, ip });
+    // Rate limit "normal" => 429 (esto NO es CONTACT_REJECTED)
+    console.warn("CONTACT_RATE_LIMITED:", { tenant, ip });
+    return jsonResponse(429, { error: "rate_limited" }, corsHeaders(origin));
   }
 
   // Persist audit row (best-effort; do not block user if insert fails)
@@ -322,7 +348,13 @@ Deno.serve(async (req) => {
     (phone ? `• *Teléfono:* ${phone}\n` : "") +
     `• *Mensaje:* ${message}\n`;
 
-  await postToSlack(String(settings.slack_webhook_url), slackText);
+
+  const slackOk = await postToSlack(String(settings.slack_webhook_url), slackText);
+
+  // Si Slack falla, devolvemos CONTACT_REJECTED (servicio no disponible)
+  if (!slackOk) {
+    return rejectService(origin, "slack_webhook_failed", { tenant });
+  }
 
   return jsonResponse(200, { ok: true }, corsHeaders(origin));
 });
