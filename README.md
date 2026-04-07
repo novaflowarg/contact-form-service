@@ -62,7 +62,7 @@ El campo contact_type acepta los siguientes valores (si se envía otro, por defe
 ### Ejemplo con cURL
 
 ```bash
-curl -X POST https://webngfbglewttiolegwk.supabase.co/functions/v1/contact \
+curl -X POST https://iggboqxkbtxbhnvvemjb.supabase.co/functions/v1/contact \
   -H "Content-Type: application/json" \
   -H "Origin: https://novaflow.com.ar" \
   -d '{
