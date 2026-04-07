@@ -15,7 +15,7 @@ Servicio backend multi-tenant para formularios de contacto públicos, construido
 ## Estructura del Proyecto
 
 - `supabase/functions/contact`: Edge Function en Deno/TypeScript.
-- `supabase/migrations/ddl.sql`: Esquema de base de datos, funciones RPC y políticas RLS.
+- `supabase/migrations/schema.sql`: Esquema de base de datos, funciones RPC y políticas RLS.
 
 ## Configuración del Tenant
 
@@ -88,7 +88,7 @@ curl -X POST https://webngfbglewttiolegwk.supabase.co/functions/v1/contact \
 
 ## Despliegue
 
-1. Aplicar migraciones: `supabase db push` (o ejecutar `ddl.sql` en el SQL Editor).
+1. Aplicar migraciones: `supabase db push` (o ejecutar `schema.sql` en el SQL Editor).
 2. Configurar variables de entorno en Supabase:
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
@@ -96,6 +96,20 @@ curl -X POST https://webngfbglewttiolegwk.supabase.co/functions/v1/contact \
    ```bash
    supabase functions deploy contact
    ```
+
+## Backup y Migración (DDL/DML)
+
+Para exportar el esquema y los datos desde una base de datos remota:
+
+### Exportar Esquema (DDL)
+```bash
+pg_dump "postgresql://postgres.webngfbglewttiolegwk:TU_PASSWORD@aws-0-us-west-2.pooler.supabase.com:5432/postgres" --schema-only > schema.sql
+```
+
+### Exportar Datos (DML)
+```bash
+pg_dump "postgresql://postgres.webngfbglewttiolegwk:TU_PASSWORD@aws-0-us-west-2.pooler.supabase.com:5432/postgres" --data-only --column-inserts > data.sql
+```
 
 ## Notas de Desarrollo
 
